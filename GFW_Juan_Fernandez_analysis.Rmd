@@ -1,0 +1,542 @@
+---
+title: "Analysis of fishing effort in Juan Fernandez Island"
+output:
+  word_document:
+  html_notebook:
+    fig_caption: yes
+---
+
+```{r message=FALSE, error=FALSE, warning=F, echo=FALSE, prompt=FALSE}
+suppressPackageStartupMessages(
+  easypackages::libraries("knitr", "tidyverse", "bigrquery", "lubridate", "broom","modelr", "DBI", "trelliscopejs", "rvest", "lfe", "lmtest", "plm", "cowplot", "gtable", "grid", "ggsci", "stringr", "lmtest", "mregions", "sf", "grid", "gridExtra")
+)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, comment = F,error = FALSE, echo = FALSE, progress = F)
+
+knitr::knit_hooks$set(inline = function(x) {
+  prettyNum(round(x,2), big.mark = ",")
+})
+
+BQ_connection <-  dbConnect(dbi_driver(),dataset = "", project = "world-fishing-827")
+```
+
+This analysis examines the distribution of vessel activity and fishing effort around Juan Fernandez Islands using Global Fishing Watch data from 2013-2016. The region of interest is the 200 nm around the islands within Chile's EEZ, as well as the adjacent high seas waters. 
+
+```{sql connection = BQ_connection, output.var = "all_positions", eval = FALSE}
+SELECT
+  a.year year,
+  a.mmsi mmsi,
+  a.timestamp timestamp,
+  a.seg_id seg_id,
+  a.lon lon,
+  a.lat lat,
+  a.hours hours,
+  a.nnet_score nnet_score,
+  a.flag_country_name flag_country_name,
+  b.label label,
+  a.eez_name eez_name
+FROM (
+  SELECT
+    YEAR(timestamp) year,
+    mmsi,
+    timestamp,
+    seg_id,
+    lon,
+    lat,
+    hours,
+    nnet_score,
+    flag_country_name,
+    eez_name
+  FROM
+    [world-fishing-827:gfw_research.nn]
+  WHERE
+    _PARTITIONTIME BETWEEN TIMESTAMP('2013-01-01')
+    AND TIMESTAMP('2016-12-31')
+    AND lat > -38.2
+    AND lat < -29.3
+    AND lon > -85.8
+    AND lon < -74.4
+    AND mmsi IN (SELECT mmsi from [gfw_research.vessel_info_20170522] WHERE on_fishing_list_nn) 
+    AND mmsi not in (SELECT mmsi from [world-fishing-827:gfw_research.vessel_info_20170522] WHERE offsetting))a
+INNER JOIN
+ (SELECT
+ mmsi,
+ label
+FROM
+ [scratch_david_mmsi_lists.nn_labels_20170516]
+where label IN ("fixed_gear",
+   "drifting_longlines",
+   "other_fishing",
+   "trawlers",
+   "purse_seines",
+   "squid_jigger"))b
+ON
+  a.mmsi = b.mmsi
+```
+
+```{r load_chile_eez_from_file, message = FALSE}
+chile_eez_sf <- st_read("chile_eez/chile_eez.shp")
+
+chile_eez_sp <- as(chile_eez_sf, "Spatial")
+
+chile_simpler_eez_sp <- rmapshaper::ms_simplify(chile_eez_sp, keep = 0.003) # this is awesome!
+
+chile_simpler_eez_sf <- st_as_sf(chile_simpler_eez_sp)
+
+# ggplot(chile_simpler_eez_sf) +
+#   geom_sf()
+```
+
+```{r load_Juan_Fernandez_clipped_eez_from_file, message = FALSE, comment=FALSE}
+juan_fernandez_eez <- st_read("chile_eez/juan_fernandez_eez.shp")
+
+ggplot(juan_fernandez_eez) +
+  geom_sf()
+```
+
+```{r make_data_frame_sf, eval = FALSE}
+all_positions_sf <- st_as_sf(all_positions, coords = c("lon","lat"))
+
+all_positions_sf <- all_positions_sf %>% 
+  sf::st_set_crs(4326)
+```
+
+```{r are_positions_within_juan_fernandez, message=FALSE, eval = FALSE}
+all_positions_sf <- sf::st_join(all_positions_sf, juan_fernandez_eez, left = TRUE)
+```
+
+```{r back_to_data_frame, eval = FALSE}
+all_positions <- all_positions_sf %>% 
+  mutate(in_juan_fernandez_area = ifelse(!is.na(PolygonID), TRUE, FALSE)) %>% 
+  replace_na(list(flag_country_name = "Unknown", label = "Unknown")) %>% 
+  mutate(label = stringr::str_replace(label, "_", " "),
+         label = stringr::str_replace(label, "_", " "),
+         label = stringr::str_to_title(label),
+         label = stringr::str_replace(label, "O", "o")) %>% 
+  mutate(lon = purrr::map_dbl(geometry, ~unlist(.)[1]),
+         lat =  purrr::map_dbl(geometry, ~unlist(.)[2])) %>% 
+  as_data_frame() %>% 
+  dplyr::select(year, mmsi, timestamp, seg_id, lon, lat, hours, nnet_score, flag_country_name, label, eez_name,in_juan_fernandez_area)
+
+write_csv(all_positions, "saved_files/all_positions.csv")
+```
+
+#### All activity in the region
+
+```{r message=FALSE}
+all_positions <- read_csv("saved_files/all_positions.csv")
+
+all_positions$flag_country_name[all_positions$flag_country_name == "Cambodia"] <- "China"
+all_positions$flag_country_name[all_positions$mmsi == 900028873 ] <- "China"
+all_positions$flag_country_name[all_positions$mmsi == 900200018 ] <- "China"
+```
+
+Between 2013 and 2016, we are able to observe `r n_distinct(all_positions$mmsi[all_positions$in_juan_fernandez_area == TRUE &  all_positions$eez_name == "Chile"], na.rm = T)` vessels operating within Chile's EEZ and around Juan Fernandez. Another, `r n_distinct(all_positions$mmsi) - n_distinct(all_positions$mmsi[all_positions$in_juan_fernandez_area == TRUE &  all_positions$eez_name == "Chile"], na.rm = T)` vessel were seen operating in the high seas waters adjacent to the EEZ.  The year with most activity was 2015, with 100 distinct vessels spending a total of 682 days in the region (table 1). The majority of this activity is by Chilean and Chinese vessels (table 2). However, the number of Chinese vessels over the entire time period is considerably larger than the number of Chilean vessels we observe (Figure 1-2).
+
+
+```{r read_data_and_summarize_by_mmsi}
+summary_by_vessel_inside_JF <- all_positions %>% 
+  filter(in_juan_fernandez_area & eez_name == "Chile") %>% 
+  group_by(year, mmsi, flag_country_name, label) %>% 
+  summarize(active_days = n_distinct(lubridate::date(timestamp)),
+            active_hours = sum(hours),
+            fishing_days = n_distinct(ifelse(nnet_score > .5, lubridate::date(timestamp),NULL)),
+            fishing_hours = sum(ifelse(nnet_score > .5 , hours, 0), na.rm = T),
+            fishing_days = ifelse(fishing_hours > 0, fishing_days, 0)) %>% 
+  ungroup()
+
+
+summary_by_vessel_inside_JF %>% 
+  group_by(year) %>% 
+  summarise(vessels = n_distinct(mmsi),
+            active_days = sum(active_days)) %>% 
+  knitr::kable(col.names = c("Year", "Vessels", "Days"), 
+               align = 'c', 
+               justify = 'c', 
+               caption = "Table 1: All vessels around Juan Fernandez and inside Chile's EEZ (2013-2016)"
+                 )
+```
+
+```{r}
+summary_by_vessel_inside_JF %>% 
+  group_by(flag_country_name) %>% 
+  summarise(vessels = n_distinct(mmsi),
+            active_days = sum(active_days)) %>% 
+  arrange(desc(vessels)) %>% 
+  knitr::kable(col.names = c("Country", "Vessels", "Days"), 
+               align = 'c', 
+               justify = 'c', 
+               caption = "Table 2: All vessels by country operating around Juan Fernandez and inside Chile's EEZ (2013-2016)"
+                 )
+```
+
+
+```{r fig.cap =  "Figure 1: Number of active day by flag state around Juan Fernandez (2013-2016). Included here are all vessel operating within Chile's EEZ"}
+all_days_by_country_bar_plot <- summary_by_vessel_inside_JF %>% 
+  group_by(flag_country_name) %>% 
+  summarise(vessels = n_distinct(mmsi),
+            active_days = sum(active_days),
+            active_hours = sum(active_hours)) %>% 
+  dplyr::top_n(10, active_days) %>% 
+  ggplot(aes(x = forcats::fct_reorder(flag_country_name, active_days), y = active_days, fill = active_days))+
+  geom_bar(stat = "identity", show.legend = F)+
+  coord_flip()+
+  xlab("")+
+  ylab("Total Days")+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_text(margin = margin(15,0,0,0)))+
+  scale_y_continuous(limits = c(0,750), breaks = c(0,150,300,450,600,750))
+
+all_days_by_country_bar_plot
+
+tiff(paste('saved_plots/all_days_by_country_bar_plot.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(all_days_by_country_bar_plot)
+invisible(dev.off())
+```
+
+```{r fig.cap = "Figure 2: Number of vessels by flag state around Juan Fernandez (2013-2016). Included here are all vessel operating within Chile's EEZ"}
+all_vessels_by_country_bar_plot <- summary_by_vessel_inside_JF %>% 
+  group_by(flag_country_name) %>% 
+  summarise(vessels = n_distinct(mmsi)) %>% 
+  dplyr::top_n(10,vessels) %>%
+  arrange(desc(vessels)) %>% 
+  head(-7) %>% 
+  ggplot(aes(x = forcats::fct_reorder(flag_country_name, vessels), y = vessels, fill = vessels))+
+  geom_bar(stat = "identity", show.legend = F)+
+  coord_flip()+
+  xlab("")+
+  ylab("Total Vessels")+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_text(margin = margin(15,0,0,0)))+
+  scale_y_continuous(limits = c(0,100), breaks = c(0,20,40,60,80,100))
+
+all_vessels_by_country_bar_plot
+
+tiff(paste('saved_plots/all_vessel_by_country_bar_plot.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(all_vessels_by_country_bar_plot)
+invisible(dev.off())
+```
+
+```{r, eval = FALSE}
+flush_plot <- function(x, title, subtitle, caption) {
+  tg <- function(label, ...) {
+    textGrob(label,  x = unit(0, "npc"), just = c("left", "bottom"),
+             gp = do.call(gpar, as.list(substitute(list(...)))[-1L])) }
+  grid.arrange(
+    tg(title, fontsize = 16, col="#2b2b2b"),
+    tg(subtitle, fontsize = 12, col="#2b2b2b"), x,
+    tg(caption, fontsize = 9, col="#2b2b2b"),
+    ncol = 1, heights=c(0.075, 0.025, 0.85, 0.05)
+  )
+}
+```
+
+Mapping the tracks of all vessels that enter Chile's EEZ reveals that the region is heavily transited by both national and foreign vessels (Figure 3). Particularly, vessel activity seems to concentrate towards the continental part of Chile's EEZ and in the high seas waters adjacent to the southeast edge of the EEZ. A closer look at vessel activity by country and gear type shows notable differences in the areas frequented by fleets from distinct nationalities and types (Figures 4-5).
+
+
+```{r fig.cap = "Figure 3: Vessel tracks around Juan Fernandez (2013-2016). Included here are all vessel operating in the region"}
+#scales::show_col(pal_npg("nrc")(10))
+(tracks_map <- all_positions %>% 
+  filter(mmsi %in% all_positions$mmsi[all_positions$in_juan_fernandez_area]) %>% 
+  arrange(timestamp) %>% 
+  ggplot() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme_minimal()+
+  theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"))+
+  geom_path(aes(x = lon, y = lat, by = seg_id, alpha = forcats::lvls_reorder(factor(in_juan_fernandez_area), 1:2)), color = "goldenrod1", size = .2, show.legend = FALSE) +
+  scale_x_continuous(limits = c(-85,-75))+
+  scale_y_continuous(limits = c(-39,-30))+
+  labs(x = "Longitude", y = "Latitude") )
+
+#flush_plot(all_tracks_plot,title = "", subtitle = "", caption = "Figure 2: All vessel activity around Juan Fernandez")
+  
+tiff(paste('saved_plots/tracks_map.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(tracks_map)
+invisible(dev.off())
+
+```
+
+```{r fig.cap = "Figure 4: Vessel tracks by flag state around Juan Fernandez (2013-2016). Included here are all vessel operating in the region"}
+(tracks_map_by_country <- all_positions %>% 
+  filter(flag_country_name %in% c("Chile", "China", "Japan","Vanuatu", "South Korea", "Spain")) %>% 
+  ggplot() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme_bw() +
+  theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7))+
+  scale_x_continuous(limits = c(-85,-75))+
+  scale_y_continuous(limits = c(-39,-30))+
+  viridis::scale_fill_viridis(option = "plasma")+
+  geom_path(aes(x = lon, y = lat, by = seg_id, alpha = forcats::lvls_reorder(factor(in_juan_fernandez_area), 1:2)), color = "goldenrod1", size = .2) +
+  labs(x = "Longitude",
+       y = "Latitude") +
+  scale_alpha_discrete(guide = FALSE)+
+  geom_sf(data = juan_fernandez_eez, fill = "transparent") +
+  facet_wrap("flag_country_name"))
+
+#flush_plot(all_tracks_plot,title = "", subtitle = "", caption = "Figure 2: All vessel activity around Juan Fernandez")
+
+tiff(paste('saved_plots/tracks_map_by_country.tiff',sep = ""), height = 12, width = 20, units = 'cm', 
+     compression = "lzw", res = 300)
+print(tracks_map_by_country)
+invisible(dev.off())
+```
+
+
+```{r fig.cap = "Figure 5: Vessel tracks by gear type around Juan Fernandez (2013-2016). Included here are all vessel operating in the region"}
+(tracks_map_by_gear <- all_positions %>% 
+  filter(!label %in% c("Fixed Gear")) %>% 
+  ggplot() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme_bw() +
+    theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7))+
+  scale_x_continuous(limits = c(-85,-75))+
+  scale_y_continuous(limits = c(-39,-30))+
+  viridis::scale_fill_viridis(option = "plasma")+
+  geom_path(aes(x = lon, y = lat, by = seg_id, alpha = forcats::lvls_reorder(factor(in_juan_fernandez_area), 1:2)), color = "goldenrod1", size = .2) +
+  labs(x = "Longitude",
+       y = "Latitude") + 
+  scale_alpha_discrete(guide = FALSE)+
+  geom_sf(data = juan_fernandez_eez, fill = "transparent") +
+  facet_wrap("label"))
+
+#flush_plot(all_tracks_plot,title = "", subtitle = "", caption = "Figure 2: All vessel activity around Juan Fernandez")
+
+tiff(paste('saved_plots/tracks_map_by_gear.tiff',sep = ""), height = 12, width = 20, units = 'cm', 
+     compression = "lzw", res = 300)
+print(tracks_map_by_gear)
+invisible(dev.off())
+```
+
+#### Fishing activity
+
+Taking a closer look at apparent fishing behavior we are able to identify `r n_distinct(summary_by_vessel_inside_JF$mmsi[summary_by_vessel_inside_JF$fishing_hours > 1], na.rm = T)` distinct vessels fishing inside Chile's EEZ and around Juan Fernandez Islands between 2013-2016. The year with most activity was 2015, with 31 fishing vessels spending a total of 288 fishing days and over 2500 fishing hours in the region (table 3). 
+
+```{r}
+summary_by_vessel_inside_JF %>% 
+    filter(fishing_hours > 1) %>% 
+  group_by(year) %>% 
+  summarise(vessels = n_distinct(mmsi),
+            fishing_days = sum(fishing_days),
+            fishing_hours = round(sum(fishing_hours), digits = 0)) %>% 
+  knitr::kable(col.names = c("Year", "Vessels", "Fishing days", "Fishing hours"), 
+               align = 'c', 
+               justify = 'c', 
+               caption = "Table 3: Vessels fishing around Juan Fernandez and inside Chile's EEZ (2013-2016)"
+                 )
+```
+
+Close to 85% of total effort was exerted by the Chilean Industrial Purse Seine fleet which is represented by 25 vessels spending a total of 445 fishing days between 2013-2016 (table 4). The remaining effort is predominantly by Chilean and Chinese Trawlers and by Chinese Squid Jiggers to a lesser extent (Figure 6-7). 
+
+```{r}
+summary_by_vessel_inside_JF %>% 
+  filter(fishing_hours > 1) %>% 
+  group_by(flag_country_name, label) %>% 
+  summarize(fishing_vessels = n_distinct(mmsi),
+            fishing_days = sum(fishing_days),
+            fishing_hours = round(sum(fishing_hours), digits = 0)) %>% 
+  arrange(desc(fishing_hours)) %>% 
+     knitr::kable(col.names = c("Flag State", "Gear Type", "Vessels", "Fishing days", "Fishing hours"), 
+               caption = " Table 4: Fishing vessels and effort by flag state and gear type around Juan Fernandez and inside Chile's EEZ (2013-2016)."
+                 )
+```
+
+```{r fig.cap = "Figure 6: Fishing days by flag state and gear type around Juan Fernandez and within Chile's EEZ (2013-2016). "}
+(fishing_days_by_country_and_gear_bar_plot <- summary_by_vessel_inside_JF %>% 
+  #filter(flag_country_name %in% c("Chile", "China", "Japan","Vanuatu", "South Korea", "Spain")) %>% 
+  group_by(flag_country_name, label) %>% 
+  summarize(fishing_vessels = n_distinct(mmsi),
+            fishing_days = sum(fishing_days),
+            fishing_hours = sum(fishing_hours)) %>% 
+    filter(fishing_hours > 1) %>% 
+  ggplot()+
+  geom_bar(aes(x = forcats::fct_reorder(flag_country_name,  fishing_days, .desc = FALSE), y = fishing_days, fill = label), stat = "identity")+
+  xlab("")+
+  ylab("Fishing Days")+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_text(margin = margin(15,0,0,0)))+
+  scale_y_continuous(limits = c(0,480))+
+  guides(fill = guide_legend(title = "Vessel type", title.hjust = 0.5))+
+  ggsci::scale_fill_locuszoom()+
+  coord_flip())
+
+tiff(paste('saved_plots/fishing_days_by_country_and_gear_bar_plot.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(fishing_days_by_country_and_gear_bar_plot)
+invisible(dev.off())
+  
+```
+
+
+```{r fig.cap = "Figure 7: Number of fishing vessels by flag state and gear type around Juan Fernandez and within Chile's EEZ (2013-2016). "}
+(fishing_vessel_by_country_and_gear_bar_plot <- summary_by_vessel_inside_JF %>% 
+  filter(fishing_hours > 1) %>% 
+  #filter(flag_country_name %in% c("Chile", "China", "Japan","Vanuatu", "South Korea", "Spain")) %>% 
+  group_by(flag_country_name, label) %>% 
+  summarize(fishing_vessels = n_distinct(mmsi)) %>% 
+  ggplot()+
+  geom_bar(aes(x = forcats::fct_reorder(flag_country_name,  fishing_vessels, .desc = FALSE), y = fishing_vessels, fill = label), stat = "identity")+
+  xlab("")+
+  ylab("Fishing Vessels")+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_text(margin = margin(15,0,0,0)))+
+  scale_y_continuous(limits = c(0,28), breaks = c(0,5,10,15,20,25))+
+  guides(fill = guide_legend(title = "Vessel type", title.hjust = 0.5))+
+  ggsci::scale_fill_locuszoom()+
+  coord_flip())
+
+tiff(paste('saved_plots/fishing_vessel_by_country_and_gear_bar_plot.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(fishing_vessel_by_country_and_gear_bar_plot)
+invisible(dev.off())
+```
+
+Mapping fishing activity in the region (inside and outside Chile EEZ) shows that effort is highest to the east and around the southern and northern borders of the EEZ. Little fishing activity can be seen near the islands themselves (Figure 8). Chile's fleet accounts for most of fishing effort to the east of Juan Fernandez. Foreign countries account for the majority of effort along the EEZ borders: Spain and Japan in the north and China, Vanuatu and South Korea to the south (Figure 9). Similarly, differences in fishing grounds exist across gear types. Purse Seiners fish mostly to the east of Juan Fernandez and inside Chile's EEZ, while longliners concentrate in the northwest borders of the EEZ, and Trawlers and squid Jiggers in the north south east edges of the EEZ (Figure 10).
+
+```{r fig.cap = "Figure 8: Fishing effort around Juan Fernandez within and adjacent to Chile's EEZ (2013-2016)"}
+
+cell_size <- 0.25 #degrees
+one_over_cellsize = 1/cell_size
+
+binned_effort <- all_positions %>% 
+  #filter(in_juan_fernandez_area) %>% 
+  mutate(lat_bin = floor(lat*one_over_cellsize)/one_over_cellsize,
+         lon_bin = floor(lon*one_over_cellsize)/one_over_cellsize) %>% 
+  group_by(lon_bin,lat_bin) %>%
+  summarize(fishing_days = n_distinct(ifelse(nnet_score > 0.5, lubridate::date(timestamp), NA)),
+            fishing_hours = sum(ifelse(nnet_score > 0.5, hours, 0), na.rm = T)) %>% 
+  filter(fishing_hours >= 4) %>% 
+  ungroup()
+
+(effort_map <- ggplot() +
+  theme_bw() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"),
+        legend.title =  element_text(margin = c(0,0,5,0, "cm"), size = rel(.9)),
+        legend.key.width =  unit(.5, "cm"))+
+  scale_x_continuous(limits = c(-85,-75)) +
+  scale_y_continuous(limits = c(-39,-30)) +
+  geom_raster(data = binned_effort, aes(lon_bin, lat_bin, fill = (fishing_hours)), 
+              interpolate = F) +
+  viridis::scale_fill_viridis(name = "Fishing hours", trans = "log", breaks = c(5, 20, 60, 200, 600)) +
+  labs(x = "Longitude",
+       y = "Latitude")+
+  geom_sf(data = juan_fernandez_eez, fill = "transparent")) 
+
+tiff(paste('saved_plots/effort_map.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(effort_map)
+invisible(dev.off())
+```
+
+
+```{r fig.cap = "Figure 9: Fishing effort by flag state around Juan Fernandez within and adjacent to Chile's EEZ (2013-2016)"}
+binned_effort_by_country <- all_positions %>% 
+  #filter(in_juan_fernandez_area) %>% 
+  mutate(lat_bin = floor(lat*one_over_cellsize)/one_over_cellsize,
+         lon_bin = floor(lon*one_over_cellsize)/one_over_cellsize) %>% 
+  group_by(flag_country_name, lon_bin,lat_bin) %>%
+  summarize(fishing_hours = sum(ifelse(nnet_score > 0.5, hours, 0), na.rm = T)) %>% 
+  filter(fishing_hours >= 4) %>% 
+  ungroup()
+
+
+(effort_map_by_country <- ggplot() +
+  theme_bw() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        legend.title =  element_text(margin = c(0,0,5,0, "cm"), size = rel(.9)),
+        legend.key.width =  unit(.5, "cm"))+
+  scale_x_continuous(limits = c(-85,-75)) +
+  scale_y_continuous(limits = c(-39,-30)) +
+  geom_raster(data = binned_effort_by_country %>% 
+                filter(flag_country_name %in% c("Chile", "China", "Japan","Vanuatu", "South Korea", "Spain")), aes(lon_bin, lat_bin, fill = (fishing_hours)), 
+              interpolate = F) +
+  viridis::scale_fill_viridis(name = "Fishing hours", trans = "log", breaks = c(5, 20, 60, 200, 600)) +
+  theme(plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm")) +
+  labs(x = "Longitude",
+       y = "Latitude")+
+  geom_sf(data = juan_fernandez_eez, fill = "transparent") +
+  facet_wrap("flag_country_name"))
+
+
+tiff(paste('saved_plots/effort_map_by_country.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(effort_map_by_country)
+invisible(dev.off())
+```
+
+```{r fig.cap = "Figure 10: Fishing effort by gear type around Juan Fernandez within and adjacent to Chile's EEZ (2013-2016)"} 
+binned_effort_by_gear <- all_positions %>% 
+  #filter(in_juan_fernandez_area) %>% 
+  mutate(lat_bin = floor(lat*one_over_cellsize)/one_over_cellsize,
+         lon_bin = floor(lon*one_over_cellsize)/one_over_cellsize) %>% 
+  group_by(label, lon_bin,lat_bin) %>%
+  summarize(fishing_hours = sum(ifelse(nnet_score > 0.5, hours, 0), na.rm = T)) %>% 
+  filter(fishing_hours >= 4) %>% 
+  ungroup()
+
+
+(effort_map_by_gear <- ggplot() +
+  theme_bw() +
+  geom_sf(data = chile_simpler_eez_sf, fill = "#4DBBD5FF") +
+  theme(panel.grid.major = element_line(colour = 'grey80', linetype = "dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm"),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        legend.title =  element_text(margin = c(0,0,5,0, "cm"), size = rel(.9)),
+        legend.key.width =  unit(.5, "cm"))+
+  scale_x_continuous(limits = c(-85,-75)) +
+  scale_y_continuous(limits = c(-39,-30)) +
+  geom_raster(data = binned_effort_by_gear, aes(lon_bin, lat_bin, fill = (fishing_hours)), 
+              interpolate = F) +
+  viridis::scale_fill_viridis(name = "Fishing hours", trans = "log", breaks = c(5, 20, 60, 200, 600)) +
+  theme(plot.margin = unit(c(0.7, 0.7, 0.7, 0.7), "cm")) +
+  labs(x = "Longitude",
+       y = "Latitude")+
+  geom_sf(data = juan_fernandez_eez, fill = "transparent") +
+  facet_wrap("label"))
+
+tiff(paste('saved_plots/effort_map_by_gear.tiff',sep = ""), height = 12, width = 17, units = 'cm', 
+     compression = "lzw", res = 300)
+print(effort_map_by_gear)
+invisible(dev.off())
+```
+
